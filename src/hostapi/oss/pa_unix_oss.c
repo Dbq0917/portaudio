@@ -577,9 +577,17 @@ static PaError BuildDeviceList( PaOSSHostApiRepresentation *ossApi )
 
     PA_DEBUG(("PaOSS %s: Total number of devices found: %d\n", __FUNCTION__, numDevices));
 
-    commonApi->deviceInfos = (PaDeviceInfo**)PaUtil_GroupAllocateZeroInitializedMemory(
-        ossApi->allocations, sizeof(PaDeviceInfo*) * numDevices );
-    memcpy( commonApi->deviceInfos, deviceInfos, numDevices * sizeof (PaDeviceInfo *) );
+    if( numDevices > 0 )
+    {
+        commonApi->deviceInfos = (PaDeviceInfo**)PaUtil_GroupAllocateZeroInitializedMemory(
+            ossApi->allocations, sizeof(PaDeviceInfo*) * numDevices );
+        if( !commonApi->deviceInfos )
+        {
+            result = paInsufficientMemory;
+            goto error;
+        }
+        memcpy( commonApi->deviceInfos, deviceInfos, numDevices * sizeof (PaDeviceInfo *) );
+    }
 
     commonApi->info.deviceCount = numDevices;
 

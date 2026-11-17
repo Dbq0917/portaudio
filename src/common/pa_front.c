@@ -68,6 +68,10 @@
 #include <stdlib.h> /* needed for strtol() */
 #include <assert.h> /* needed by PA_VALIDATE_ENDIANNESS */
 
+#if defined(__linux__)
+#include <sys/stat.h>
+#endif
+
 #include "portaudio.h"
 #include "pa_util.h"
 #include "pa_endianness.h"
@@ -145,7 +149,11 @@ void PaUtil_SetLastHostErrorInfo( PaHostApiTypeId hostApiType, long errorCode,
     lastHostErrorInfo_.hostApiType = hostApiType;
     lastHostErrorInfo_.errorCode = errorCode;
 
-    strncpy( lastHostErrorText_, errorText, PA_LAST_HOST_ERROR_TEXT_LENGTH_ );
+    if( errorText )
+        strncpy( lastHostErrorText_, errorText, PA_LAST_HOST_ERROR_TEXT_LENGTH_ );
+    else
+        lastHostErrorText_[0] = '\0';
+    lastHostErrorText_[PA_LAST_HOST_ERROR_TEXT_LENGTH_] = '\0';
 }
 
 
@@ -157,10 +165,25 @@ static int initializationCount_ = 0;
 static int initializing_ = 0;
 static int deviceCount_ = 0;
 
+static int safeEnumerationMode_ = 1;
+static int enumerationLogEnabled_ = 1;
+static unsigned long deviceCacheTtlMs_ = 5000;
+static int deviceCacheDirty_ = 1;
+static PaTime deviceCacheExpiresAt_ = 0;
+static PaTime deviceCacheRetryAfter_ = 0;
+static PaError deviceCacheRefreshError_ = paNoError;
+static int refreshingDeviceList_ = 0;
+static PaError lastDeviceEnumerationError_ = paNoError;
+static int failedHostApiCount_ = 0;
+static unsigned char loggedHostApiFailures_[64];
+static PaError lastLoggedRefreshError_ = paNoError;
+
 PaUtilStreamRepresentation *firstOpenStream_ = NULL;
 
 
 #define PA_IS_INITIALISED_ (initializationCount_ != 0)
+#define PA_MAX_ENUMERATED_DEVICES_ 65536
+#define PA_MAX_DEVICE_CHANNELS_ 65536
 
 
 static int CountHostApiInitializers( void )
@@ -173,16 +196,128 @@ static int CountHostApiInitializers( void )
 }
 
 
-static void TerminateHostApis( void )
+static void InitializeEnumerationPolicy( void )
+{
+    const char *mode = getenv( "PA_DEVICE_ENUMERATION_MODE" );
+    const char *logEnabled = getenv( "PA_DEVICE_ENUMERATION_LOG" );
+    const char *cacheTtl = getenv( "PA_DEVICE_CACHE_TTL_MS" );
+
+    safeEnumerationMode_ = !( mode && strcmp( mode, "compat" ) == 0 );
+    enumerationLogEnabled_ = !( logEnabled && strcmp( logEnabled, "0" ) == 0 );
+
+    if( cacheTtl )
+    {
+        char *end = NULL;
+        unsigned long value = strtoul( cacheTtl, &end, 10 );
+
+        if( end != cacheTtl && *end == '\0' && value <= 3600000UL )
+            deviceCacheTtlMs_ = value;
+    }
+}
+
+
+static void LogDeviceEnumerationFailure( int hostApiIndex,
+        const char *hostApiName, PaError error )
+{
+    if( !enumerationLogEnabled_ )
+        return;
+    if( hostApiIndex >= 0 &&
+            hostApiIndex < (int)sizeof( loggedHostApiFailures_ ) )
+    {
+        if( loggedHostApiFailures_[hostApiIndex] )
+            return;
+        loggedHostApiFailures_[hostApiIndex] = 1;
+    }
+
+    PaUtil_DebugPrint(
+            "PortAudio device enumeration: host API %d (%s) failed: %d (%s)\n",
+            hostApiIndex,
+            hostApiName ? hostApiName : "unknown",
+            error,
+            Pa_GetErrorText( error ) );
+}
+
+
+static int DeviceInfoIsValid( const PaDeviceInfo *deviceInfo )
+{
+    if( !deviceInfo )
+        return 0;
+    if( !deviceInfo->name )
+        return 0;
+    if( deviceInfo->maxInputChannels < 0 ||
+            deviceInfo->maxInputChannels > PA_MAX_DEVICE_CHANNELS_ ||
+            deviceInfo->maxOutputChannels < 0 ||
+            deviceInfo->maxOutputChannels > PA_MAX_DEVICE_CHANNELS_ )
+    {
+        return 0;
+    }
+    return 1;
+}
+
+
+static PaError ValidateHostApiRepresentation(
+        PaUtilHostApiRepresentation *hostApi )
+{
+    int i;
+
+    if( !hostApi || !hostApi->Terminate || !hostApi->OpenStream ||
+            !hostApi->IsFormatSupported )
+    {
+        return paDeviceEnumerationFailed;
+    }
+
+    if( !hostApi->info.name )
+        return paDeviceEnumerationFailed;
+
+    if( hostApi->info.deviceCount < 0 ||
+            hostApi->info.deviceCount > PA_MAX_ENUMERATED_DEVICES_ )
+    {
+        return paDeviceEnumerationFailed;
+    }
+
+    if( hostApi->info.defaultInputDevice < paNoDevice ||
+            hostApi->info.defaultInputDevice >= hostApi->info.deviceCount )
+    {
+        return paDeviceEnumerationFailed;
+    }
+
+    if( hostApi->info.defaultOutputDevice < paNoDevice ||
+            hostApi->info.defaultOutputDevice >= hostApi->info.deviceCount )
+    {
+        return paDeviceEnumerationFailed;
+    }
+
+    if( hostApi->info.deviceCount > 0 && !hostApi->deviceInfos )
+        return paDeviceEnumerationFailed;
+
+    for( i = 0; i < hostApi->info.deviceCount; ++i )
+    {
+        if( !DeviceInfoIsValid( hostApi->deviceInfos[i] ) )
+            return paDeviceEnumerationFailed;
+    }
+
+    return paNoError;
+}
+
+
+static void TerminateHostApiList( PaUtilHostApiRepresentation **hostApis,
+        int hostApisCount )
 {
     /* terminate in reverse order from initialization */
+    while( hostApisCount > 0 )
+    {
+        PaUtilHostApiRepresentation *hostApi = hostApis[--hostApisCount];
+        if( hostApi && hostApi->Terminate )
+            hostApi->Terminate( hostApi );
+    }
+}
+
+
+static void TerminateHostApis( void )
+{
     PA_DEBUG(("TerminateHostApis in \n"));
 
-    while( hostApisCount_ > 0 )
-    {
-        --hostApisCount_;
-        hostApis_[hostApisCount_]->Terminate( hostApis_[hostApisCount_] );
-    }
+    TerminateHostApiList( hostApis_, hostApisCount_ );
     hostApisCount_ = 0;
     defaultHostApiIndex_ = 0;
     deviceCount_ = 0;
@@ -199,48 +334,88 @@ static PaError InitializeHostApis( void )
 {
     PaError result = paNoError;
     int i, initializerCount, baseDeviceIndex;
+    int apiCount = 0;
+    int unavailableBackendCount = 0;
+    int localDefaultHostApiIndex = -1;
+    int localDeviceCount = 0;
+    PaUtilHostApiRepresentation **apis = NULL;
 
     initializerCount = CountHostApiInitializers();
 
-    hostApis_ = (PaUtilHostApiRepresentation**)PaUtil_AllocateZeroInitializedMemory(
-            sizeof(PaUtilHostApiRepresentation*) * initializerCount );
-    if( !hostApis_ )
+    failedHostApiCount_ = 0;
+    lastDeviceEnumerationError_ = paNoError;
+
+    if( initializerCount == 0 )
     {
-        result = paInsufficientMemory;
-        goto error;
+        hostApisCount_ = 0;
+        defaultHostApiIndex_ = 0;
+        deviceCount_ = 0;
+        return paNoError;
     }
 
-    hostApisCount_ = 0;
-    defaultHostApiIndex_ = -1; /* indicates that we haven't determined the default host API yet */
-    deviceCount_ = 0;
+    apis = (PaUtilHostApiRepresentation**)PaUtil_AllocateZeroInitializedMemory(
+            sizeof(PaUtilHostApiRepresentation*) * initializerCount );
+    if( !apis )
+        return paInsufficientMemory;
+
     baseDeviceIndex = 0;
 
     for( i=0; i< initializerCount; ++i )
     {
-        hostApis_[hostApisCount_] = NULL;
+        PaUtilHostApiRepresentation *hostApi = NULL;
+        PaError backendResult;
 
         PA_DEBUG(( "before paHostApiInitializers[%d].\n",i));
 
-        result = paHostApiInitializers[i]( &hostApis_[hostApisCount_], hostApisCount_ );
-        if( result != paNoError )
-            goto error;
+        backendResult = paHostApiInitializers[i]( &hostApi, apiCount );
 
         PA_DEBUG(( "after paHostApiInitializers[%d].\n",i));
 
-        if( hostApis_[hostApisCount_] )
+        if( backendResult != paNoError )
         {
-            PaUtilHostApiRepresentation* hostApi = hostApis_[hostApisCount_];
-            assert( hostApi->info.defaultInputDevice < hostApi->info.deviceCount );
-            assert( hostApi->info.defaultOutputDevice < hostApi->info.deviceCount );
+            ++failedHostApiCount_;
+            lastDeviceEnumerationError_ = backendResult;
+            LogDeviceEnumerationFailure( i, NULL, backendResult );
+            continue;
+        }
+
+        if( !hostApi )
+        {
+            ++unavailableBackendCount;
+            PA_DEBUG(( "paHostApiInitializers[%d] reported no host API.\n",
+                    i ));
+            continue;
+        }
+
+        backendResult = ValidateHostApiRepresentation( hostApi );
+        if( backendResult != paNoError )
+        {
+            ++failedHostApiCount_;
+            lastDeviceEnumerationError_ = backendResult;
+            LogDeviceEnumerationFailure( i, hostApi->info.name, backendResult );
+            if( hostApi->Terminate )
+                hostApi->Terminate( hostApi );
+            continue;
+        }
+
+        {
+            int deviceIndex;
+
+            for( deviceIndex = 0;
+                    deviceIndex < hostApi->info.deviceCount;
+                    ++deviceIndex )
+            {
+                hostApi->deviceInfos[deviceIndex]->hostApi = apiCount;
+            }
 
             /* the first successfully initialized host API with a default input *or*
                output device is used as the default host API.
             */
-            if( (defaultHostApiIndex_ == -1) &&
+            if( (localDefaultHostApiIndex == -1) &&
                     ( hostApi->info.defaultInputDevice != paNoDevice
                         || hostApi->info.defaultOutputDevice != paNoDevice ) )
             {
-                defaultHostApiIndex_ = hostApisCount_;
+                localDefaultHostApiIndex = apiCount;
             }
 
             hostApi->privatePaFrontInfo.baseDeviceIndex = baseDeviceIndex;
@@ -252,21 +427,316 @@ static PaError InitializeHostApis( void )
                 hostApi->info.defaultOutputDevice += baseDeviceIndex;
 
             baseDeviceIndex += hostApi->info.deviceCount;
-            deviceCount_ += hostApi->info.deviceCount;
+            localDeviceCount += hostApi->info.deviceCount;
 
-            ++hostApisCount_;
+            apis[apiCount++] = hostApi;
         }
     }
 
     /* if no host APIs have devices, the default host API is the first initialized host API */
+    if( localDefaultHostApiIndex == -1 )
+        localDefaultHostApiIndex = apiCount > 0 ? 0 : -1;
+
+    if( apiCount == 0 &&
+            ( failedHostApiCount_ > 0 || unavailableBackendCount > 0 ) )
+    {
+        if( lastDeviceEnumerationError_ == paNoError )
+            lastDeviceEnumerationError_ = paDeviceEnumerationFailed;
+        result = paDeviceEnumerationFailed;
+        goto error;
+    }
+
+    hostApis_ = apis;
+    hostApisCount_ = apiCount;
+    defaultHostApiIndex_ = localDefaultHostApiIndex;
+    deviceCount_ = localDeviceCount;
+    return paNoError;
+
+error:
+    TerminateHostApiList( apis, apiCount );
+    PaUtil_FreeMemory( apis );
+    hostApis_ = NULL;
+    hostApisCount_ = 0;
+    defaultHostApiIndex_ = 0;
+    deviceCount_ = 0;
+    return result;
+}
+
+
+static PaError InitializeHostApisCompat( void )
+{
+    PaError result = paNoError;
+    int i, initializerCount, baseDeviceIndex;
+
+    initializerCount = CountHostApiInitializers();
+    hostApis_ = (PaUtilHostApiRepresentation**)PaUtil_AllocateZeroInitializedMemory(
+            sizeof(PaUtilHostApiRepresentation*) * initializerCount );
+    if( !hostApis_ && initializerCount > 0 )
+        return paInsufficientMemory;
+
+    hostApisCount_ = 0;
+    defaultHostApiIndex_ = -1;
+    deviceCount_ = 0;
+    baseDeviceIndex = 0;
+    failedHostApiCount_ = 0;
+    lastDeviceEnumerationError_ = paNoError;
+
+    for( i = 0; i < initializerCount; ++i )
+    {
+        hostApis_[hostApisCount_] = NULL;
+        result = paHostApiInitializers[i]( &hostApis_[hostApisCount_],
+                hostApisCount_ );
+        if( result != paNoError )
+            goto error;
+
+        if( hostApis_[hostApisCount_] )
+        {
+            PaUtilHostApiRepresentation *hostApi = hostApis_[hostApisCount_];
+
+            if( ( defaultHostApiIndex_ == -1 ) &&
+                    ( hostApi->info.defaultInputDevice != paNoDevice ||
+                      hostApi->info.defaultOutputDevice != paNoDevice ) )
+            {
+                defaultHostApiIndex_ = hostApisCount_;
+            }
+
+            hostApi->privatePaFrontInfo.baseDeviceIndex = baseDeviceIndex;
+            if( hostApi->info.defaultInputDevice != paNoDevice )
+                hostApi->info.defaultInputDevice += baseDeviceIndex;
+            if( hostApi->info.defaultOutputDevice != paNoDevice )
+                hostApi->info.defaultOutputDevice += baseDeviceIndex;
+
+            baseDeviceIndex += hostApi->info.deviceCount;
+            deviceCount_ += hostApi->info.deviceCount;
+            ++hostApisCount_;
+        }
+    }
+
     if( defaultHostApiIndex_ == -1 )
         defaultHostApiIndex_ = 0;
-
-    return result;
+    return paNoError;
 
 error:
     TerminateHostApis();
     return result;
+}
+
+
+static PaError ValidateCurrentDeviceEnumeration( void )
+{
+    int i;
+    int totalDevices = 0;
+
+    if( hostApisCount_ > 0 && !hostApis_ )
+        return paDeviceEnumerationFailed;
+    if( hostApisCount_ > 0 &&
+            ( defaultHostApiIndex_ < 0 ||
+              defaultHostApiIndex_ >= hostApisCount_ ) )
+    {
+        return paDeviceEnumerationFailed;
+    }
+
+    for( i = 0; i < hostApisCount_; ++i )
+    {
+        PaUtilHostApiRepresentation *hostApi = hostApis_[i];
+        int deviceIndex;
+        int baseDeviceIndex;
+
+        if( !hostApi || !hostApi->Terminate || !hostApi->OpenStream ||
+                !hostApi->IsFormatSupported || !hostApi->info.name )
+        {
+            return paDeviceEnumerationFailed;
+        }
+
+        if( hostApi->info.deviceCount < 0 ||
+                hostApi->info.deviceCount > PA_MAX_ENUMERATED_DEVICES_ )
+        {
+            return paDeviceEnumerationFailed;
+        }
+
+        if( hostApi->info.deviceCount > 0 && !hostApi->deviceInfos )
+            return paDeviceEnumerationFailed;
+
+        baseDeviceIndex = (int)hostApi->privatePaFrontInfo.baseDeviceIndex;
+        if( hostApi->info.defaultInputDevice < paNoDevice ||
+                ( hostApi->info.defaultInputDevice != paNoDevice &&
+                  ( hostApi->info.defaultInputDevice < baseDeviceIndex ||
+                    hostApi->info.defaultInputDevice >=
+                        baseDeviceIndex + hostApi->info.deviceCount ) ) )
+        {
+            return paDeviceEnumerationFailed;
+        }
+
+        if( hostApi->info.defaultOutputDevice < paNoDevice ||
+                ( hostApi->info.defaultOutputDevice != paNoDevice &&
+                  ( hostApi->info.defaultOutputDevice < baseDeviceIndex ||
+                    hostApi->info.defaultOutputDevice >=
+                        baseDeviceIndex + hostApi->info.deviceCount ) ) )
+        {
+            return paDeviceEnumerationFailed;
+        }
+
+        for( deviceIndex = 0;
+                deviceIndex < hostApi->info.deviceCount;
+                ++deviceIndex )
+        {
+            if( !DeviceInfoIsValid( hostApi->deviceInfos[deviceIndex] ) )
+                return paDeviceEnumerationFailed;
+            if( hostApi->deviceInfos[deviceIndex]->hostApi != i )
+                return paDeviceEnumerationFailed;
+        }
+
+        totalDevices += hostApi->info.deviceCount;
+    }
+
+    if( totalDevices != deviceCount_ )
+        return paDeviceEnumerationFailed;
+    return paNoError;
+}
+
+
+static int DeviceTopologyChanged( void )
+{
+#if defined(__linux__)
+    struct stat st;
+    static int initialized = 0;
+    static unsigned long lastSeconds = 0;
+    static unsigned long lastNanoseconds = 0;
+    static unsigned long long lastInode = 0;
+
+    if( stat( "/dev/snd", &st ) != 0 )
+        return 0;
+
+    if( !initialized )
+    {
+        initialized = 1;
+        lastSeconds = (unsigned long)st.st_mtim.tv_sec;
+        lastNanoseconds = (unsigned long)st.st_mtim.tv_nsec;
+        lastInode = (unsigned long long)st.st_ino;
+        return 0;
+    }
+
+    if( lastSeconds != (unsigned long)st.st_mtim.tv_sec ||
+            lastNanoseconds != (unsigned long)st.st_mtim.tv_nsec ||
+            lastInode != (unsigned long long)st.st_ino )
+    {
+        lastSeconds = (unsigned long)st.st_mtim.tv_sec;
+        lastNanoseconds = (unsigned long)st.st_mtim.tv_nsec;
+        lastInode = (unsigned long long)st.st_ino;
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+
+static PaError RefreshDeviceListInternal( void )
+{
+    PaError result;
+    PaUtilHostApiRepresentation **oldHostApis;
+    int oldHostApisCount;
+    int oldDefaultHostApiIndex;
+    int oldDeviceCount;
+
+    if( !PA_IS_INITIALISED_ )
+        return paNotInitialized;
+    if( refreshingDeviceList_ )
+        return paDeviceEnumerationBusy;
+    if( firstOpenStream_ != NULL )
+        return paDeviceEnumerationBusy;
+
+    /* Build a complete replacement list before touching the active one. This
+       keeps the previous list usable if all replacement backends fail. */
+    refreshingDeviceList_ = 1;
+    oldHostApis = hostApis_;
+    oldHostApisCount = hostApisCount_;
+    oldDefaultHostApiIndex = defaultHostApiIndex_;
+    oldDeviceCount = deviceCount_;
+
+    hostApis_ = NULL;
+    hostApisCount_ = 0;
+    defaultHostApiIndex_ = 0;
+    deviceCount_ = 0;
+
+    result = safeEnumerationMode_ ? InitializeHostApis() :
+            InitializeHostApisCompat();
+
+    if( result == paNoError && safeEnumerationMode_ )
+        result = ValidateCurrentDeviceEnumeration();
+
+    if( result != paNoError )
+    {
+        lastDeviceEnumerationError_ = result;
+        TerminateHostApis();
+        hostApis_ = oldHostApis;
+        hostApisCount_ = oldHostApisCount;
+        defaultHostApiIndex_ = oldDefaultHostApiIndex;
+        deviceCount_ = oldDeviceCount;
+    }
+    else
+    {
+        TerminateHostApiList( oldHostApis, oldHostApisCount );
+        if( oldHostApis )
+            PaUtil_FreeMemory( oldHostApis );
+    }
+
+    refreshingDeviceList_ = 0;
+    deviceCacheDirty_ = result != paNoError;
+    if( result == paNoError )
+    {
+        deviceCacheRefreshError_ = paNoError;
+        deviceCacheRetryAfter_ = 0;
+    }
+    else
+    {
+        PaTime retryDelay = (PaTime)deviceCacheTtlMs_ / 1000.0;
+
+        if( retryDelay <= 0 || retryDelay > 1.0 )
+            retryDelay = 1.0;
+        deviceCacheRefreshError_ = result;
+        deviceCacheRetryAfter_ = PaUtil_GetTime() + retryDelay;
+    }
+    deviceCacheExpiresAt_ = PaUtil_GetTime() +
+            ( (PaTime)deviceCacheTtlMs_ / 1000.0 );
+    if( result == paNoError )
+        lastLoggedRefreshError_ = paNoError;
+    else if( enumerationLogEnabled_ && result != lastLoggedRefreshError_ )
+    {
+        lastLoggedRefreshError_ = result;
+        PaUtil_DebugPrint(
+                "PortAudio device enumeration: refresh failed: %d (%s); "
+                "keeping previous device list\n",
+                result, Pa_GetErrorText( result ) );
+    }
+
+    return result;
+}
+
+
+static PaError RefreshDeviceCacheIfNeeded( void )
+{
+    PaTime now;
+
+    if( !safeEnumerationMode_ )
+        return paNoError;
+    if( refreshingDeviceList_ )
+        return paNoError;
+    if( firstOpenStream_ != NULL )
+        return paNoError;
+
+    if( DeviceTopologyChanged() )
+        deviceCacheDirty_ = 1;
+
+    now = PaUtil_GetTime();
+    if( deviceCacheDirty_ && now < deviceCacheRetryAfter_ )
+        return deviceCacheRefreshError_;
+    if( deviceCacheDirty_ ||
+            ( deviceCacheTtlMs_ > 0 && now >= deviceCacheExpiresAt_ ) )
+    {
+        return RefreshDeviceListInternal();
+    }
+
+    return paNoError;
 }
 
 
@@ -287,15 +757,21 @@ static int FindHostApi( PaDeviceIndex device, int *hostSpecificDeviceIndex )
     if( device < 0 )
         return -1;
 
+    if( !hostApis_ )
+        return -1;
+
     while( i < hostApisCount_
-            && device >= hostApis_[i]->info.deviceCount )
+            && ( !hostApis_[i] ||
+                 device >= hostApis_[i]->info.deviceCount ) )
     {
+        if( !hostApis_[i] )
+            return -1;
 
         device -= hostApis_[i]->info.deviceCount;
         ++i;
     }
 
-    if( i >= hostApisCount_ )
+    if( i >= hostApisCount_ || !hostApis_[i] )
         return -1;
 
     if( hostSpecificDeviceIndex )
@@ -382,9 +858,43 @@ PaError Pa_Initialize( void )
         PaUtil_InitializeClock();
         PaUtil_ResetTraceMessages();
 
-        result = InitializeHostApis();
+        InitializeEnumerationPolicy();
+        memset( loggedHostApiFailures_, 0, sizeof(loggedHostApiFailures_) );
+        lastLoggedRefreshError_ = paNoError;
+        result = safeEnumerationMode_ ? InitializeHostApis() :
+                InitializeHostApisCompat();
+
         if( result == paNoError )
+        {
             ++initializationCount_;
+            if( safeEnumerationMode_ )
+            {
+                result = ValidateCurrentDeviceEnumeration();
+                if( result != paNoError )
+                {
+                    --initializationCount_;
+                    TerminateHostApis();
+                    lastDeviceEnumerationError_ = result;
+                    if( enumerationLogEnabled_ )
+                    {
+                        PaUtil_DebugPrint(
+                                "PortAudio device enumeration: startup self-check "
+                                "failed: %d (%s)\n",
+                                result, Pa_GetErrorText( result ) );
+                    }
+                }
+            }
+        }
+
+        if( result == paNoError )
+        {
+            deviceCacheDirty_ = 0;
+            deviceCacheExpiresAt_ = PaUtil_GetTime() +
+                    ( (PaTime)deviceCacheTtlMs_ / 1000.0 );
+            deviceCacheRetryAfter_ = 0;
+            deviceCacheRefreshError_ = paNoError;
+            DeviceTopologyChanged();
+        }
 
         initializing_ = 0;
     }
@@ -409,6 +919,12 @@ PaError Pa_Terminate( void )
             CloseOpenStreams();
 
             TerminateHostApis();
+            deviceCacheDirty_ = 1;
+            deviceCacheExpiresAt_ = 0;
+            deviceCacheRetryAfter_ = 0;
+            deviceCacheRefreshError_ = paNoError;
+            lastDeviceEnumerationError_ = paNoError;
+            failedHostApiCount_ = 0;
 
             PaUtil_DumpTraceMessages();
         }
@@ -470,6 +986,8 @@ const char *Pa_GetErrorText( PaError errorCode )
     case paIncompatibleStreamHostApi: result = "Incompatible stream host API"; break;
     case paBadBufferPtr:             result = "Bad buffer pointer"; break;
     case paCanNotInitializeRecursively: result = "PortAudio can not be initialized recursively"; break;
+    case paDeviceEnumerationFailed:  result = "Device enumeration failed"; break;
+    case paDeviceEnumerationBusy:    result = "Device enumeration is busy or blocked by open streams"; break;
     default:
         if( errorCode > 0 )
             result = "Invalid error code (value greater than zero)";
@@ -499,7 +1017,8 @@ PaHostApiIndex Pa_HostApiTypeIdToHostApiIndex( PaHostApiTypeId type )
 
         for( i=0; i < hostApisCount_; ++i )
         {
-            if( hostApis_[i]->info.type == type )
+            if( hostApis_ && hostApis_[i] &&
+                    hostApis_[i]->info.type == type )
             {
                 result = i;
                 break;
@@ -523,13 +1042,18 @@ PaError PaUtil_GetHostApiRepresentation( struct PaUtilHostApiRepresentation **ho
     {
         result = paNotInitialized;
     }
+    else if( !hostApi )
+    {
+        result = paInternalError;
+    }
     else
     {
         result = paHostApiNotFound;
 
         for( i=0; i < hostApisCount_; ++i )
         {
-            if( hostApis_[i]->info.type == type )
+            if( hostApis_ && hostApis_[i] &&
+                    hostApis_[i]->info.type == type )
             {
                 *hostApi = hostApis_[i];
                 result = paNoError;
@@ -547,6 +1071,9 @@ PaError PaUtil_DeviceIndexToHostApiDeviceIndex(
 {
     PaError result;
     PaDeviceIndex x;
+
+    if( !hostApiDevice || !hostApi )
+        return paInternalError;
 
     x = device - hostApi->privatePaFrontInfo.baseDeviceIndex;
 
@@ -602,7 +1129,8 @@ PaHostApiIndex Pa_GetDefaultHostApi( void )
         /* internal consistency check: make sure that the default host api
          index is within range */
 
-        if( result < 0 || result >= hostApisCount_ )
+        if( result < 0 || result >= hostApisCount_ || !hostApis_ ||
+                !hostApis_[result] )
         {
             result = paInternalError;
         }
@@ -629,7 +1157,8 @@ const PaHostApiInfo* Pa_GetHostApiInfo( PaHostApiIndex hostApi )
         PA_LOGAPI(("\tPaHostApiInfo*: NULL [ PortAudio not initialized ]\n" ));
 
     }
-    else if( hostApi < 0 || hostApi >= hostApisCount_ )
+    else if( hostApi < 0 || hostApi >= hostApisCount_ || !hostApis_ ||
+            !hostApis_[hostApi] )
     {
         info = NULL;
 
@@ -675,7 +1204,7 @@ PaDeviceIndex Pa_HostApiDeviceIndexToDeviceIndex( PaHostApiIndex hostApi, int ho
         }
         else
         {
-            if( hostApiDeviceIndex < 0 ||
+            if( hostApiDeviceIndex < 0 || !hostApis_[hostApi] ||
                     hostApiDeviceIndex >= hostApis_[hostApi]->info.deviceCount )
             {
                 result = paInvalidDevice;
@@ -696,6 +1225,7 @@ PaDeviceIndex Pa_HostApiDeviceIndexToDeviceIndex( PaHostApiIndex hostApi, int ho
 PaDeviceIndex Pa_GetDeviceCount( void )
 {
     PaDeviceIndex result;
+    PaError refreshResult;
 
     PA_LOGAPI_ENTER( "Pa_GetDeviceCount" );
 
@@ -705,7 +1235,8 @@ PaDeviceIndex Pa_GetDeviceCount( void )
     }
     else
     {
-        result = deviceCount_;
+        refreshResult = RefreshDeviceCacheIfNeeded();
+        result = refreshResult == paNoError ? deviceCount_ : refreshResult;
     }
 
     PA_LOGAPI_EXIT_PAERROR_OR_T_RESULT( "Pa_GetDeviceCount", "PaDeviceIndex: %d", result );
@@ -721,6 +1252,13 @@ PaDeviceIndex Pa_GetDefaultInputDevice( void )
 
     PA_LOGAPI_ENTER( "Pa_GetDefaultInputDevice" );
 
+    if( PA_IS_INITIALISED_ && RefreshDeviceCacheIfNeeded() != paNoError )
+    {
+        PA_LOGAPI_EXIT_T( "Pa_GetDefaultInputDevice", "PaDeviceIndex: %d",
+                paNoDevice );
+        return paNoDevice;
+    }
+
     hostApi = Pa_GetDefaultHostApi();
     if( hostApi < 0 )
     {
@@ -728,7 +1266,8 @@ PaDeviceIndex Pa_GetDefaultInputDevice( void )
     }
     else
     {
-        result = hostApis_[hostApi]->info.defaultInputDevice;
+        result = hostApis_[hostApi] ?
+                hostApis_[hostApi]->info.defaultInputDevice : paNoDevice;
     }
 
     PA_LOGAPI_EXIT_T( "Pa_GetDefaultInputDevice", "PaDeviceIndex: %d", result );
@@ -744,6 +1283,13 @@ PaDeviceIndex Pa_GetDefaultOutputDevice( void )
 
     PA_LOGAPI_ENTER( "Pa_GetDefaultOutputDevice" );
 
+    if( PA_IS_INITIALISED_ && RefreshDeviceCacheIfNeeded() != paNoError )
+    {
+        PA_LOGAPI_EXIT_T( "Pa_GetDefaultOutputDevice", "PaDeviceIndex: %d",
+                paNoDevice );
+        return paNoDevice;
+    }
+
     hostApi = Pa_GetDefaultHostApi();
     if( hostApi < 0 )
     {
@@ -751,7 +1297,8 @@ PaDeviceIndex Pa_GetDefaultOutputDevice( void )
     }
     else
     {
-        result = hostApis_[hostApi]->info.defaultOutputDevice;
+        result = hostApis_[hostApi] ?
+                hostApis_[hostApi]->info.defaultOutputDevice : paNoDevice;
     }
 
     PA_LOGAPI_EXIT_T( "Pa_GetDefaultOutputDevice", "PaDeviceIndex: %d", result );
@@ -760,16 +1307,60 @@ PaDeviceIndex Pa_GetDefaultOutputDevice( void )
 }
 
 
+PaError Pa_RefreshDeviceList( void )
+{
+    PaError result;
+
+    PA_LOGAPI_ENTER( "Pa_RefreshDeviceList" );
+    result = RefreshDeviceListInternal();
+    PA_LOGAPI_EXIT_PAERROR( "Pa_RefreshDeviceList", result );
+    return result;
+}
+
+
+PaError Pa_InvalidateDeviceCache( void )
+{
+    if( !PA_IS_INITIALISED_ )
+        return paNotInitialized;
+
+    deviceCacheDirty_ = 1;
+    deviceCacheExpiresAt_ = 0;
+    deviceCacheRetryAfter_ = 0;
+    deviceCacheRefreshError_ = paNoError;
+    return paNoError;
+}
+
+
+PaError Pa_RunDeviceEnumerationSelfCheck( void )
+{
+    if( !PA_IS_INITIALISED_ )
+        return paNotInitialized;
+    return ValidateCurrentDeviceEnumeration();
+}
+
+
+PaError Pa_GetLastDeviceEnumerationError( void )
+{
+    return lastDeviceEnumerationError_;
+}
+
+
 const PaDeviceInfo* Pa_GetDeviceInfo( PaDeviceIndex device )
 {
     int hostSpecificDeviceIndex;
-    int hostApiIndex = FindHostApi( device, &hostSpecificDeviceIndex );
+    int hostApiIndex;
     PaDeviceInfo *result;
-
 
     PA_LOGAPI_ENTER_PARAMS( "Pa_GetDeviceInfo" );
     PA_LOGAPI(("\tPaDeviceIndex device: %d\n", device ));
 
+    if( !PA_IS_INITIALISED_ )
+        return NULL;
+
+    if( RefreshDeviceCacheIfNeeded() != paNoError )
+        return NULL;
+
+    hostApiIndex = FindHostApi( device, &hostSpecificDeviceIndex );
     if( hostApiIndex < 0 )
     {
         result = NULL;
@@ -780,7 +1371,15 @@ const PaDeviceInfo* Pa_GetDeviceInfo( PaDeviceIndex device )
     }
     else
     {
-        result = hostApis_[hostApiIndex]->deviceInfos[ hostSpecificDeviceIndex ];
+        PaUtilHostApiRepresentation *hostApi = hostApis_[hostApiIndex];
+
+        if( !hostApi || !hostApi->deviceInfos )
+            result = NULL;
+        else
+            result = hostApi->deviceInfos[ hostSpecificDeviceIndex ];
+
+        if( !result || !result->name )
+            return NULL;
 
         PA_LOGAPI(("Pa_GetDeviceInfo returned:\n" ));
         PA_LOGAPI(("\tPaDeviceInfo*: 0x%p:\n", result ));
@@ -1092,6 +1691,13 @@ PaError Pa_IsFormatSupported( const PaStreamParameters *inputParameters,
         return result;
     }
 
+    result = RefreshDeviceCacheIfNeeded();
+    if( result != paNoError )
+    {
+        PA_LOGAPI_EXIT_PAERROR( "Pa_IsFormatSupported", result );
+        return result;
+    }
+
     result = ValidateOpenStreamParameters( inputParameters,
                                            outputParameters,
                                            sampleRate, 0, paNoFlag, 0,
@@ -1202,6 +1808,15 @@ PaError Pa_OpenStream( PaStream** stream,
     {
         result = paNotInitialized;
 
+        PA_LOGAPI(("Pa_OpenStream returned:\n" ));
+        PA_LOGAPI(("\t*(PaStream** stream): undefined\n" ));
+        PA_LOGAPI(("\tPaError: %d ( %s )\n", result, Pa_GetErrorText( result ) ));
+        return result;
+    }
+
+    result = RefreshDeviceCacheIfNeeded();
+    if( result != paNoError )
+    {
         PA_LOGAPI(("Pa_OpenStream returned:\n" ));
         PA_LOGAPI(("\t*(PaStream** stream): undefined\n" ));
         PA_LOGAPI(("\tPaError: %d ( %s )\n", result, Pa_GetErrorText( result ) ));

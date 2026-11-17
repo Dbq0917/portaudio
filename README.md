@@ -18,6 +18,13 @@ For information on compiling programs with PortAudio, please see the
 tutorial at:
 
   http://portaudio.com/docs/v19-doxydocs/tutorial_start.html
+
+## Device enumeration hardening
+
+Device enumeration isolates unhealthy host APIs, validates device tables,
+supports cache invalidation and explicit hotplug refresh, and exposes a startup
+self-check. See `doc/device-enumeration-hardening.md` for rollout flags,
+rollback procedures, and acceptance evidence.
   
 We have an active mailing list for user and developer discussions.
 Please feel free to join. See http://www.portaudio.com for details.

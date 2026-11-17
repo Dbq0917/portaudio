@@ -153,7 +153,9 @@ typedef enum PaErrorCode
     paCanNotWriteToAnInputOnlyStream,
     paIncompatibleStreamHostApi,
     paBadBufferPtr,
-    paCanNotInitializeRecursively
+    paCanNotInitializeRecursively,
+    paDeviceEnumerationFailed,
+    paDeviceEnumerationBusy
 } PaErrorCode;
 
 
@@ -176,6 +178,11 @@ const char *Pa_GetErrorText( PaError errorCode );
 
  Note that if Pa_Initialize() returns an error code, Pa_Terminate() should
  NOT be called.
+
+ A failing host API does not prevent other host APIs from being initialized.
+ The healthy backends remain available and the last non-fatal backend error is
+ reported by Pa_GetLastDeviceEnumerationError(). If no host API can provide a
+ valid device table, Pa_Initialize() returns paDeviceEnumerationFailed.
 
  @return paNoError if successful, otherwise an error code indicating the cause
  of failure.
@@ -420,6 +427,10 @@ const PaHostErrorInfo* Pa_GetLastHostErrorInfo( void );
 /** Retrieve the number of available devices. The number of available devices
  may be zero.
 
+ The result is cached. A stale cache is refreshed automatically when it is
+ invalidated or its age limit is reached, unless a stream is open. The refresh
+ preserves host API and device ordering.
+
  @return A non-negative value indicating the number of available devices or,
  a PaErrorCode (which are always negative) if PortAudio is not initialized
  or an error is encountered.
@@ -452,6 +463,69 @@ PaDeviceIndex Pa_GetDefaultInputDevice( void );
  the supplied application "pa_devs".
 */
 PaDeviceIndex Pa_GetDefaultOutputDevice( void );
+
+
+/** Refresh PortAudio's cached device list from the native audio backends.
+
+ The device list is cached after Pa_Initialize() and by calls to this
+ function. Pa_InvalidateDeviceCache() marks the cache stale so that the next
+ enumeration call refreshes it automatically. A device-list change callback
+ supplied by an operating-system integration should call
+ Pa_InvalidateDeviceCache() or Pa_RefreshDeviceList() from its controller
+ thread.
+
+ The relative order of host APIs and of devices within each host API is
+ preserved across refreshes. Device indexes and PaDeviceInfo pointers returned
+ before a successful refresh are invalidated by the refresh.
+
+ If a host API fails while refreshing, its devices are omitted; other host APIs
+ are still refreshed. If no host API can provide a device list, the previous
+ cached list is retained and paDeviceEnumerationFailed is returned.
+
+ This function returns paDeviceEnumerationBusy without changing the active
+ list if any PortAudio stream is open.
+
+ @return paNoError on success, otherwise an error code.
+
+ @see Pa_InvalidateDeviceCache
+*/
+PaError Pa_RefreshDeviceList( void );
+
+
+/** Mark PortAudio's cached device list as stale.
+
+ The next call that enumerates devices refreshes the cache, unless a stream is
+ open, in which case the existing list remains active until the stream is
+ closed. This is intended to be called by the device-list change integration
+ when the operating system reports an audio-device hotplug event.
+
+ @return paNoError on success, paNotInitialized if PortAudio is not initialized.
+*/
+PaError Pa_InvalidateDeviceCache( void );
+
+
+/** Validate the currently cached device enumeration.
+
+ This check is also run automatically at the end of Pa_Initialize(). It
+ verifies the host API/device counts, default-device indexes and the minimum
+ fields required by the public API without touching native audio devices.
+
+ @return paNoError if the cached list is internally consistent, otherwise
+ paDeviceEnumerationFailed or paNotInitialized.
+*/
+PaError Pa_RunDeviceEnumerationSelfCheck( void );
+
+
+/** Return the last non-fatal device-enumeration error.
+
+ A return value of paNoError means that the most recent enumeration had no
+ backend failures. After a partial failure, PortAudio keeps the healthy
+ backends and reports the failed backend's error here. Use
+ Pa_GetLastHostErrorInfo() for the host-specific error text.
+
+ @return the last enumeration error code, or paNoError if none was recorded.
+*/
+PaError Pa_GetLastDeviceEnumerationError( void );
 
 
 /** The type used to represent monotonic time in seconds. PaTime is
@@ -535,7 +609,9 @@ typedef struct PaDeviceInfo
 
  @note PortAudio manages the memory referenced by the returned pointer,
  the client must not manipulate or free the memory. The pointer is only
- guaranteed to be valid between calls to Pa_Initialize() and Pa_Terminate().
+ guaranteed to be valid until the device list is refreshed by
+ Pa_RefreshDeviceList(), invalidation followed by an enumeration call,
+ or Pa_Terminate().
 
  @see PaDeviceInfo, PaDeviceIndex
 */

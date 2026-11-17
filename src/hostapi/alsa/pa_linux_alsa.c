@@ -862,6 +862,10 @@ PaError PaAlsa_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiIndex
     PaError result = paNoError;
     PaAlsaHostApiRepresentation *alsaHostApi = NULL;
 
+    if( !hostApi )
+        return paInternalError;
+    *hostApi = NULL;
+
     /* Try loading Alsa library. */
     if (!PaAlsa_LoadLibrary())
         return paNoError;
@@ -908,6 +912,9 @@ PaError PaAlsa_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiIndex
     return result;
 
 error:
+    if( hostApi )
+        *hostApi = NULL;
+
     if( alsaHostApi )
     {
         if( alsaHostApi->allocations )
@@ -1191,7 +1198,12 @@ static PaError PaAlsa_StrDup( PaAlsaHostApiRepresentation *alsaApi,
         const char *src)
 {
     PaError result = paNoError;
-    int len = strlen( src ) + 1;
+    int len;
+
+    if( !alsaApi || !alsaApi->allocations || !dst || !src )
+        return paDeviceEnumerationFailed;
+
+    len = strlen( src ) + 1;
 
     /* PA_DEBUG(("PaStrDup %s %d\n", src, len)); */
 
@@ -1211,6 +1223,9 @@ static int IgnorePlugin( const char *pluginId )
         "file", "null", "shm", "cards", "rate_convert", NULL};
     int i = 0;
 
+    if( !pluginId )
+        return 1;
+
     if( getenv( "PA_ALSA_IGNORE_ALL_PLUGINS" ) && atoi( getenv( "PA_ALSA_IGNORE_ALL_PLUGINS") ) )
         return 1;
 
@@ -1229,7 +1244,12 @@ static int IgnorePlugin( const char *pluginId )
 /* Skip past parts at the beginning of a (pcm) info name that are already in the card name, to avoid duplication */
 static char *SkipCardDetailsInName( char *infoSkipName, char *cardRefName )
 {
-    char *lastSpacePosn = infoSkipName;
+    char *lastSpacePosn;
+
+    if( !infoSkipName || !cardRefName )
+        return NULL;
+
+    lastSpacePosn = infoSkipName;
 
     /* Skip matching chars; but only in chunks separated by ' ' (not part words etc), so track lastSpacePosn */
     while( *cardRefName )
@@ -1298,9 +1318,18 @@ static PaError FillInDevInfo( PaAlsaHostApiRepresentation *alsaApi, HwDevInfo* d
         PaAlsaDeviceInfo* devInfo, int* devIdx )
 {
     PaError result = 0;
-    PaDeviceInfo *baseDeviceInfo = &devInfo->baseDeviceInfo;
+    PaDeviceInfo *baseDeviceInfo;
     snd_pcm_t *pcm = NULL;
-    PaUtilHostApiRepresentation *baseApi = &alsaApi->baseHostApiRep;
+    PaUtilHostApiRepresentation *baseApi;
+
+    if( !alsaApi || !deviceHwInfo || !deviceHwInfo->name ||
+            !deviceHwInfo->alsaName || !devInfo || !devIdx )
+    {
+        return paDeviceEnumerationFailed;
+    }
+
+    baseDeviceInfo = &devInfo->baseDeviceInfo;
+    baseApi = &alsaApi->baseHostApiRep;
 
     PA_DEBUG(( "%s: Filling device info for: %s\n", __FUNCTION__, deviceHwInfo->name ));
 
@@ -1468,6 +1497,10 @@ static PaError BuildDeviceList( PaAlsaHostApiRepresentation *alsaApi )
             }
 
             infoName = SkipCardDetailsInName( (char *)alsa_snd_pcm_info_get_name( pcmInfo ), cardName );
+            if( !infoName )
+                infoName = (char *)alsa_snd_pcm_info_get_name( pcmInfo );
+            if( !infoName )
+                infoName = "unknown";
 
             /* The length of the string written by snprintf plus terminating 0 */
             len = snprintf( NULL, 0, "%s: %s (%s)", cardName, infoName, buf ) + 1;

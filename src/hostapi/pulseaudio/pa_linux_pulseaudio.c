@@ -260,11 +260,12 @@ void PaPulseAudio_CheckContextStateCb( pa_context * c,
     PaPulseAudio_HostApiRepresentation *ptr =
       (PaPulseAudio_HostApiRepresentation *) userdata;
     /* If this is null we have big problems and we probably are out of memory */
-    if( !c )
+    if( !c || !ptr )
     {
         PA_PULSEAUDIO_SET_LAST_HOST_ERROR( 0,
                                            "PaPulseAudio_CheckContextStateCb: Invalid context " );
-        pa_threaded_mainloop_signal( ptr->mainloop, 0 );
+        if( ptr && ptr->mainloop )
+            pa_threaded_mainloop_signal( ptr->mainloop, 0 );
         return;
     }
 
@@ -279,11 +280,12 @@ void PaPulseAudio_ServerInfoCb( pa_context *c,
     PaPulseAudio_HostApiRepresentation *pulseaudioHostApi =
       (PaPulseAudio_HostApiRepresentation *) userdata;
 
-    if( !c  || !i )
+    if( !c || !i || !pulseaudioHostApi )
     {
         PA_PULSEAUDIO_SET_LAST_HOST_ERROR( 0,
                                          "PaPulseAudio_ServerInfoCb: Invalid context or can't get server info" );
-        pa_threaded_mainloop_signal( pulseaudioHostApi->mainloop, 0 );
+        if( pulseaudioHostApi && pulseaudioHostApi->mainloop )
+            pa_threaded_mainloop_signal( pulseaudioHostApi->mainloop, 0 );
         return;
     }
 
@@ -306,6 +308,20 @@ int _PaPulseAudio_AddAudioDevice( PaPulseAudio_HostApiRepresentation *hostapi,
                                   double defaultHighOutputLatency,
                                   const long defaultSampleRate )
 {
+    if( !hostapi || !hostapi->allocations || !PaPulseAudio_SinkSourceName ||
+            !PaPulseAudio_SinkSourceNameDesc )
+    {
+        PA_PULSEAUDIO_SET_LAST_HOST_ERROR( 0,
+                                          "_PaPulseAudio_AddAudioDevice: Invalid device data" );
+        return paDeviceEnumerationFailed;
+    }
+
+    if( hostapi->deviceCount < 0 ||
+            hostapi->deviceCount >= PAPULSEAUDIO_MAX_DEVICECOUNT )
+    {
+        return paDeviceUnavailable;
+    }
+
     /* These should be at least 1
      *
      * Maximun size of string is 1024 (PAPULSEAUDIO_MAX_DEVICENAME)
@@ -323,20 +339,12 @@ int _PaPulseAudio_AddAudioDevice( PaPulseAudio_HostApiRepresentation *hostapi,
                                                    pulseaudioRealNameSize );
     pulseaudioLocalDeviceName = PaUtil_GroupAllocateZeroInitializedMemory( hostapi->allocations,
                                                                 pulseaudioDeviceNameSize );
-    if( !hostapi->pulseaudioDeviceNames[hostapi->deviceCount] &&
+    if( !hostapi->pulseaudioDeviceNames[hostapi->deviceCount] ||
         !pulseaudioLocalDeviceName )
     {
         PA_PULSEAUDIO_SET_LAST_HOST_ERROR( 0,
                                           "_PaPulseAudio_AddAudioDevice: Can't alloc memory" );
         return paInsufficientMemory;
-    }
-
-    /* We can maximum have 1024 (PAPULSEAUDIO_MAX_DEVICECOUNT)
-     * devices where to choose which should be mostly enough
-     */
-    if( hostapi->deviceCount >= PAPULSEAUDIO_MAX_DEVICECOUNT )
-    {
-        return paDeviceUnavailable;
     }
 
     snprintf( hostapi->pulseaudioDeviceNames[hostapi->deviceCount],
@@ -375,7 +383,12 @@ void PaPulseAudio_SinkListCb( pa_context * c,
 
 
     /* If this is null we have big problems and we probably are out of memory */
-    if( !c || !l )
+    if( !pulseaudioHostApi || !pulseaudioHostApi->mainloop )
+    {
+        return;
+    }
+
+    if( !c )
     {
         PA_PULSEAUDIO_SET_LAST_HOST_ERROR( 0,
                                            "PaPulseAudio_SinkListCb: Invalid context or sink info" );
@@ -385,6 +398,13 @@ void PaPulseAudio_SinkListCb( pa_context * c,
     /* If eol is set to a positive number, you're at the end of the list */
     if( eol > 0 )
     {
+        goto error;
+    }
+
+    if( !l )
+    {
+        PA_PULSEAUDIO_SET_LAST_HOST_ERROR( 0,
+                                           "PaPulseAudio_SinkListCb: Invalid sink info" );
         goto error;
     }
 
@@ -427,6 +447,11 @@ void PaPulseAudio_SourceListCb( pa_context * c,
 
 
     /* If this is null we have big problems and we probably are out of memory */
+    if( !pulseaudioHostApi || !pulseaudioHostApi->mainloop )
+    {
+        return;
+    }
+
     if( !c )
     {
         PA_PULSEAUDIO_SET_LAST_HOST_ERROR( 0,
@@ -437,6 +462,13 @@ void PaPulseAudio_SourceListCb( pa_context * c,
     /* If eol is set to a positive number, you're at the end of the list */
     if( eol > 0 )
     {
+        goto error;
+    }
+
+    if( !l )
+    {
+        PA_PULSEAUDIO_SET_LAST_HOST_ERROR( 0,
+                                           "PaPulseAudio_SourceListCb: Invalid source info" );
         goto error;
     }
 
@@ -539,7 +571,7 @@ void PaPulseAudio_StreamUnderflowCb( pa_stream *s,
     pa_buffer_attr *pulseaudioOutputSampleSpec = NULL;
 
     /* If this is null we have big problems and we probably are out of memory */
-    if( !s )
+    if( !s || !stream || !stream->mainloop )
     {
         PA_DEBUG( ("Portaudio %s: Invalid stream",
                    __FUNCTION__) );
@@ -548,6 +580,11 @@ void PaPulseAudio_StreamUnderflowCb( pa_stream *s,
 
     stream->outputUnderflows++;
     pulseaudioOutputSampleSpec = (pa_buffer_attr *)pa_stream_get_buffer_attr(s);
+    if( !pulseaudioOutputSampleSpec )
+    {
+        pa_threaded_mainloop_signal( stream->mainloop, 0 );
+        return;
+    }
     PA_DEBUG( ("Portaudio %s: PulseAudio '%s' with delay: %ld stream has underflowed\n",
                __FUNCTION__,
                pa_stream_get_device_name(s),
@@ -569,6 +606,10 @@ PaError PaPulseAudio_Initialize( PaUtilHostApiRepresentation ** hostApi,
     PaDeviceInfo *deviceInfoArray = NULL;
 
     pa_operation *pulseaudioOperation = NULL;
+
+    if( !hostApi )
+        return paInternalError;
+    *hostApi = NULL;
 
     pulseaudioHostApi = PaPulseAudio_New();
 
@@ -787,6 +828,8 @@ PaError PaPulseAudio_Initialize( PaUtilHostApiRepresentation ** hostApi,
     return result;
 
     error:
+    if( hostApi )
+        *hostApi = NULL;
 
     if( pulseaudioHostApi )
     {

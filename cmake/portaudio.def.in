@@ -39,6 +39,10 @@ Pa_GetStreamWriteAvailable          @32
 Pa_GetSampleSize                    @33
 Pa_Sleep                            @34
 Pa_GetVersionInfo                   @35
+Pa_RefreshDeviceList                @36
+Pa_InvalidateDeviceCache            @37
+Pa_RunDeviceEnumerationSelfCheck    @38
+Pa_GetLastDeviceEnumerationError    @39
 ; add new portable public API functions here. DO NOT CHANGE EXISTING ORDINALS!
 @DEF_EXCLUDE_ASIO_SYMBOLS@PaAsio_GetAvailableBufferSizes      @50
 @DEF_EXCLUDE_ASIO_SYMBOLS@PaAsio_ShowControlPanel             @51

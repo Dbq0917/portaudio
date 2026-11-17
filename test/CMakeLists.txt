@@ -1,6 +1,36 @@
 # Test projects
 # Use the macro to add test projects
 
+if(UNIX)
+  add_executable(patest_device_enumeration
+    patest_device_enumeration.c
+    pa_enumeration_fault_hostapis.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/pa_allocation.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/pa_converters.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/pa_cpuload.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/pa_debugprint.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/pa_dither.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/pa_front.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/pa_process.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/pa_ringbuffer.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/pa_stream.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/pa_trace.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/os/unix/pa_pthread_util.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/os/unix/pa_unix_util.c
+  )
+  target_include_directories(patest_device_enumeration PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/os/unix
+  )
+  if(IS_BIG_ENDIAN)
+    target_compile_definitions(patest_device_enumeration PRIVATE PA_BIG_ENDIAN)
+  else()
+    target_compile_definitions(patest_device_enumeration PRIVATE PA_LITTLE_ENDIAN)
+  endif()
+  target_link_libraries(patest_device_enumeration PRIVATE Threads::Threads m)
+endif()
+
 add_test(pa_minlat)
 add_test(patest1)
 add_test(patest_buffer)
@@ -63,3 +93,4 @@ if(UNIX)
     add_test(patest_write_stop_hang_illegal)
 endif()
 add_test(patest_enumerate_default_latency)
+add_test(patest_enumeration_bench)
